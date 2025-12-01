@@ -40,11 +40,17 @@ class FirebaseService:
                 # 1. Prefer JSON from environment (best for platforms like Render)
                 if self.credentials_json:
                     try:
-                        cred_info = json.loads(self.credentials_json)
+                        # Handle both string JSON and already parsed JSON
+                        if isinstance(self.credentials_json, str):
+                            cred_info = json.loads(self.credentials_json)
+                        else:
+                            cred_info = self.credentials_json
                         cred = credentials.Certificate(cred_info)
-                        logger.info("Initializing Firebase from FIREBASE_CREDENTIALS_JSON")
+                        logger.info("Initializing Firebase from FIREBASE_CREDENTIALS_JSON (environment variable)")
+                    except json.JSONDecodeError as e:
+                        logger.error(f"Failed to parse FIREBASE_CREDENTIALS_JSON as JSON: {e}")
                     except Exception as e:
-                        logger.error(f"Failed to parse FIREBASE_CREDENTIALS_JSON: {e}")
+                        logger.error(f"Failed to initialize Firebase from FIREBASE_CREDENTIALS_JSON: {e}")
 
                 # 2. Fallback to credentials file path
                 if cred is None and os.path.exists(self.credentials_path):
