@@ -14,6 +14,10 @@ import json
 from datetime import datetime
 from firebase_service import FirebaseService
 import logging
+import subprocess
+import tempfile
+import glob
+import zipfile
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -342,6 +346,174 @@ def _get_latest_apk_info():
     return filepath, latest_apk, download_url
 
 
+def _extract_certificate_using_apksigner(apk_path):
+    """
+    Extract certificate using apksigner tool (Android SDK).
+    This is the most reliable method.
+    """
+    try:
+        # Try to find apksigner in common locations
+        apksigner_paths = [
+            'apksigner',
+            os.path.expanduser('~/Library/Android/sdk/build-tools/*/apksigner'),
+            os.path.expanduser('~/Android/Sdk/build-tools/*/apksigner'),
+            '/opt/android-sdk/build-tools/*/apksigner',
+        ]
+        
+        apksigner = None
+        for path in apksigner_paths:
+            if '*' in path:
+                matches = glob.glob(path)
+                if matches:
+                    apksigner = sorted(matches)[-1]  # Use latest version
+                    break
+            elif os.path.exists(path):
+                apksigner = path
+                break
+        
+        if not apksigner:
+            # Try to find it in PATH
+            result = subprocess.run(['which', 'apksigner'], 
+                                  capture_output=True, text=True)
+            if result.returncode == 0:
+                apksigner = result.stdout.strip()
+        
+        if not apksigner:
+            raise FileNotFoundError("apksigner not found. Install Android SDK build-tools.")
+        
+        # Extract certificate using apksigner
+        result = subprocess.run(
+            [apksigner, 'verify', '--print-certs', apk_path],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        
+        # Parse certificate from output
+        # apksigner outputs certificates in PEM format
+        cert_pem = result.stdout
+        if '-----BEGIN CERTIFICATE-----' not in cert_pem:
+            raise ValueError("Could not extract certificate from apksigner output")
+        
+        # Extract first certificate
+        cert_start = cert_pem.find('-----BEGIN CERTIFICATE-----')
+        cert_end = cert_pem.find('-----END CERTIFICATE-----', cert_start) + len('-----END CERTIFICATE-----')
+        cert_pem = cert_pem[cert_start:cert_end]
+        
+        # Convert PEM to DER
+        from cryptography import x509
+        from cryptography.hazmat.backends import default_backend
+        from cryptography.hazmat.primitives import serialization
+        cert = x509.load_pem_x509_certificate(cert_pem.encode(), default_backend())
+        return cert.public_bytes(serialization.Encoding.DER)
+        
+    except subprocess.CalledProcessError as e:
+        raise ValueError(f"apksigner failed: {e.stderr}")
+    except Exception as e:
+        raise ValueError(f"Error using apksigner: {str(e)}")
+
+
+def _extract_certificate_using_jarsigner(apk_path):
+    """
+    Extract certificate using jarsigner tool (Java JDK).
+    Fallback method if apksigner is not available.
+    """
+    try:
+        # Extract certificate from APK META-INF
+        with zipfile.ZipFile(apk_path, 'r') as apk:
+            cert_files = [f for f in apk.namelist() 
+                         if f.startswith('META-INF/') and (f.endswith('.RSA') or f.endswith('.DSA'))]
+            
+            if not cert_files:
+                raise ValueError("No certificate found in APK")
+            
+            cert_file = cert_files[0]
+            cert_data = apk.read(cert_file)
+            
+            # Try to extract certificate from PKCS#7 structure
+            # Use openssl if available
+            with tempfile.NamedTemporaryFile(suffix='.rsa', delete=False) as tmp_cert:
+                tmp_cert.write(cert_data)
+                tmp_cert_path = tmp_cert.name
+            
+            try:
+                # Use openssl to extract certificate
+                result = subprocess.run(
+                    ['openssl', 'pkcs7', '-inform', 'DER', '-in', tmp_cert_path, 
+                     '-print_certs', '-outform', 'PEM'],
+                    capture_output=True,
+                    text=True,
+                    check=True
+                )
+                
+                cert_pem = result.stdout
+                if '-----BEGIN CERTIFICATE-----' not in cert_pem:
+                    raise ValueError("Could not extract certificate")
+                
+                # Extract first certificate
+                cert_start = cert_pem.find('-----BEGIN CERTIFICATE-----')
+                cert_end = cert_pem.find('-----END CERTIFICATE-----', cert_start) + len('-----END CERTIFICATE-----')
+                cert_pem = cert_pem[cert_start:cert_end]
+                
+                from cryptography import x509
+                from cryptography.hazmat.backends import default_backend
+                from cryptography.hazmat.primitives import serialization
+                cert = x509.load_pem_x509_certificate(cert_pem.encode(), default_backend())
+                return cert.public_bytes(serialization.Encoding.DER)
+                
+            finally:
+                os.unlink(tmp_cert_path)
+                
+    except FileNotFoundError:
+        raise ValueError("jarsigner or openssl not found")
+    except Exception as e:
+        raise ValueError(f"Error using jarsigner: {str(e)}")
+
+
+def _compute_certificate_checksum(apk_path):
+    """
+    Compute SHA-256 checksum of the APK's signing certificate.
+    
+    Returns:
+        tuple: (base64_checksum, base64url_checksum, hex_checksum)
+    """
+    if not os.path.exists(apk_path):
+        raise FileNotFoundError(f"APK file not found: {apk_path}")
+    
+    cert_der = None
+    method_used = None
+    
+    # Try apksigner first (most reliable)
+    try:
+        cert_der = _extract_certificate_using_apksigner(apk_path)
+        method_used = "apksigner"
+    except Exception as e1:
+        # Fallback to jarsigner + openssl
+        try:
+            cert_der = _extract_certificate_using_jarsigner(apk_path)
+            method_used = "jarsigner+openssl"
+        except Exception as e2:
+            raise ValueError(
+                f"Could not extract certificate. Tried:\n"
+                f"  1. apksigner: {str(e1)}\n"
+                f"  2. jarsigner+openssl: {str(e2)}\n\n"
+                f"Please install Android SDK build-tools (for apksigner) or "
+                f"Java JDK + OpenSSL (for jarsigner+openssl)."
+            )
+    
+    # Compute SHA-256 of the certificate
+    sha256_digest = hashlib.sha256(cert_der).digest()
+    
+    # Encode as base64 and base64url
+    checksum_b64 = base64.b64encode(sha256_digest).decode('utf-8')
+    checksum_b64url = _base64_to_base64url(checksum_b64)
+    checksum_hex = sha256_digest.hex()
+    
+    logger.info(f"Certificate extracted using: {method_used}")
+    
+    return checksum_b64, checksum_b64url, checksum_hex
+
+
 def _base64_to_base64url(b64_string):
     """
     Convert standard base64 encoding to base64url encoding.
@@ -362,26 +534,27 @@ def _build_device_owner_payload():
     Uses:
     - com.aoc.aoc_doapp/.MyDeviceAdminReceiver as the device admin component
     - Latest uploaded APK as the package download location
-    - SHA-256 (base64url) of the APK as the signature checksum
+    - SHA-256 (base64url) of the APK file as the signature checksum
     """
     filepath, filename, download_url = _get_latest_apk_info()
     if not filepath:
         raise FileNotFoundError('No APK files found. Please upload an APK first.')
 
-    # Calculate SHA-256 and encode as base64url (required by Android for checksum)
-    # Note: This calculates SHA-256 of the entire APK file.
-    # For Device Owner provisioning, Android typically requires the certificate's SHA-256,
-    # but some setups use the file's SHA-256. This matches: sha256sum <apk> | awk '{print $1}' | xxd -r -p | base64
+    # Calculate SHA-256 of the APK file itself (like: shasum -a 256 your_app.apk)
+    # Then convert to base64url format (required by Android Device Owner provisioning)
     with open(filepath, 'rb') as f:
         apk_content = f.read()
         digest = hashlib.sha256(apk_content).digest()
+    
+    # Encode as base64, then convert to base64url
     checksum_b64 = base64.b64encode(digest).decode()
-    # Convert to base64url format (required by Android Device Owner provisioning)
     checksum_b64url = _base64_to_base64url(checksum_b64)
+    checksum_hex = digest.hex()
     
     # Log checksum for debugging
-    logger.info(f"Generated checksum (base64) for {filename}: {checksum_b64}")
-    logger.info(f"Generated checksum (base64url) for {filename}: {checksum_b64url}")
+    logger.info(f"APK file checksum (hex) for {filename}: {checksum_hex}")
+    logger.info(f"APK file checksum (base64) for {filename}: {checksum_b64}")
+    logger.info(f"APK file checksum (base64url) for {filename}: {checksum_b64url}")
     logger.info(f"APK file size: {len(apk_content)} bytes")
 
     payload = {
@@ -489,8 +662,9 @@ def get_device_owner_qr():
 @app.route('/api/apk/verify-checksum', methods=['GET'])
 def verify_checksum():
     """
-    Verify and display the checksum for the latest APK.
+    Verify and display the checksum for the latest APK file.
     Useful for debugging provisioning issues.
+    Returns the SHA-256 of the APK file itself (like: shasum -a 256 your_app.apk).
     """
     try:
         filepath, filename, download_url = _get_latest_apk_info()
@@ -500,10 +674,11 @@ def verify_checksum():
                 'error': 'No APK files found. Please upload an APK first.'
             }), 404
         
-        # Calculate checksum
+        # Calculate SHA-256 of the APK file itself
         with open(filepath, 'rb') as f:
             apk_content = f.read()
             digest = hashlib.sha256(apk_content).digest()
+        
         checksum_b64 = base64.b64encode(digest).decode()
         checksum_b64url = _base64_to_base64url(checksum_b64)
         checksum_hex = digest.hex()
@@ -514,11 +689,13 @@ def verify_checksum():
             'success': True,
             'filename': filename,
             'file_size': file_size,
+            'checksum_type': 'apk_file_sha256',
             'checksum_base64': checksum_b64,
             'checksum_base64url': checksum_b64url,
             'checksum_hex': checksum_hex,
             'download_url': download_url,
-            'verification_command': f'sha256sum {filename} | awk \'{{print $1}}\' | xxd -r -p | base64'
+            'verification_command': f'shasum -a 256 {filename}',
+            'note': 'This is the SHA-256 of the APK file itself, converted to base64url format for Device Owner provisioning'
         })
     except Exception as e:
         logger.error(f"Error verifying checksum: {str(e)}")
