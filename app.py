@@ -23,7 +23,13 @@ CORS(app)
 
 # Load configuration from environment variables
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'your-secret-key-change-in-production')
-app.config['BASE_URL'] = os.getenv('DASHBOARD_BASE_URL', 'http://localhost:5001')
+base_url = os.getenv('DASHBOARD_BASE_URL', 'http://localhost:5001')
+# Force HTTPS in production (required for Android Device Owner provisioning)
+if os.getenv('FLASK_ENV') == 'production' or os.getenv('ENVIRONMENT') == 'production':
+    if base_url.startswith('http://'):
+        base_url = base_url.replace('http://', 'https://', 1)
+        logger.warning(f"Converted BASE_URL to HTTPS: {base_url}")
+app.config['BASE_URL'] = base_url
 app.config['APK_STORAGE'] = os.getenv('APK_STORAGE_PATH', 'uploads/apk')
 
 # Initialize Firebase service
@@ -179,7 +185,13 @@ def upload_apk():
         filepath = os.path.join(app.config['APK_STORAGE'], filename)
         file.save(filepath)
         
+        # Generate download URL - ensure HTTPS in production
         download_url = url_for('download_apk', filename=filename, _external=True)
+        
+        # Force HTTPS if in production (required for Device Owner provisioning)
+        if (os.getenv('FLASK_ENV') == 'production' or os.getenv('ENVIRONMENT') == 'production') and download_url.startswith('http://'):
+            download_url = download_url.replace('http://', 'https://', 1)
+            logger.info(f"Converted download URL to HTTPS: {download_url}")
         
         return jsonify({
             'success': True,
@@ -196,7 +208,15 @@ def upload_apk():
 
 @app.route('/api/apk/download/<filename>', methods=['GET'])
 def download_apk(filename):
-    """Download APK file"""
+    """
+    Download APK file with correct MIME type and headers for Android Device Owner provisioning.
+    
+    Requirements:
+    - Content-Type: application/vnd.android.package-archive
+    - Content-Length: file size
+    - No redirects (direct file serving)
+    - HTTPS URL (enforced in production)
+    """
     try:
         filepath = os.path.join(app.config['APK_STORAGE'], filename)
         if not os.path.exists(filepath):
@@ -205,7 +225,35 @@ def download_apk(filename):
                 'error': 'APK file not found'
             }), 404
         
-        return send_file(filepath, as_attachment=True, download_name=filename)
+        # Get file size for Content-Length header
+        file_size = os.path.getsize(filepath)
+        
+        # Send file with correct MIME type for Android APK
+        # as_attachment=False to serve directly (not as download)
+        # This is required for Device Owner provisioning
+        # conditional=True enables range requests for better streaming of large files
+        response = send_file(
+            filepath,
+            mimetype='application/vnd.android.package-archive',
+            as_attachment=False,
+            download_name=filename,
+            conditional=True  # Enables HTTP 206 Partial Content for better streaming
+        )
+        
+        # Set Content-Length header explicitly (send_file should set this, but ensure it's correct)
+        response.headers['Content-Length'] = str(file_size)
+        
+        # Disable caching to ensure fresh downloads
+        response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+        response.headers['Pragma'] = 'no-cache'
+        response.headers['Expires'] = '0'
+        
+        # Ensure no redirects - direct file serving
+        # Remove any Location header that might cause redirects
+        if 'Location' in response.headers:
+            del response.headers['Location']
+        
+        return response
     except Exception as e:
         logger.error(f"Error downloading APK: {str(e)}")
         return jsonify({
@@ -230,6 +278,11 @@ def generate_qr_code():
         # Get the most recent APK
         latest_apk = max(apk_files, key=lambda f: os.path.getmtime(os.path.join(apk_dir, f)))
         download_url = url_for('download_apk', filename=latest_apk, _external=True)
+        
+        # Force HTTPS if in production (required for Device Owner provisioning)
+        if (os.getenv('FLASK_ENV') == 'production' or os.getenv('ENVIRONMENT') == 'production') and download_url.startswith('http://'):
+            download_url = download_url.replace('http://', 'https://', 1)
+            logger.info(f"Converted download URL to HTTPS: {download_url}")
         
         # Generate QR code
         qr = qrcode.QRCode(
@@ -273,7 +326,15 @@ def _get_latest_apk_info():
 
     latest_apk = max(apk_files, key=lambda f: os.path.getmtime(os.path.join(apk_dir, f)))
     filepath = os.path.join(apk_dir, latest_apk)
+    
+    # Generate download URL - ensure HTTPS in production
     download_url = url_for('download_apk', filename=latest_apk, _external=True)
+    
+    # Force HTTPS if in production (required for Device Owner provisioning)
+    if (os.getenv('FLASK_ENV') == 'production' or os.getenv('ENVIRONMENT') == 'production') and download_url.startswith('http://'):
+        download_url = download_url.replace('http://', 'https://', 1)
+        logger.info(f"Converted download URL to HTTPS: {download_url}")
+    
     return filepath, latest_apk, download_url
 
 
@@ -291,9 +352,17 @@ def _build_device_owner_payload():
         raise FileNotFoundError('No APK files found. Please upload an APK first.')
 
     # Calculate SHA-256 and encode as base64 (required by Android for checksum)
+    # Note: This calculates SHA-256 of the entire APK file.
+    # For Device Owner provisioning, Android typically requires the certificate's SHA-256,
+    # but some setups use the file's SHA-256. This matches: sha256sum <apk> | awk '{print $1}' | xxd -r -p | base64
     with open(filepath, 'rb') as f:
-        digest = hashlib.sha256(f.read()).digest()
+        apk_content = f.read()
+        digest = hashlib.sha256(apk_content).digest()
     checksum_b64 = base64.b64encode(digest).decode()
+    
+    # Log checksum for debugging
+    logger.info(f"Generated checksum for {filename}: {checksum_b64}")
+    logger.info(f"APK file size: {len(apk_content)} bytes")
 
     payload = {
         "android.app.extra.PROVISIONING_DEVICE_ADMIN_COMPONENT_NAME": "com.aoc.aoc_doapp/.MyDeviceAdminReceiver",
@@ -391,6 +460,45 @@ def get_device_owner_qr():
         }), 404
     except Exception as e:
         logger.error(f"Error generating device owner QR code: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/api/apk/verify-checksum', methods=['GET'])
+def verify_checksum():
+    """
+    Verify and display the checksum for the latest APK.
+    Useful for debugging provisioning issues.
+    """
+    try:
+        filepath, filename, download_url = _get_latest_apk_info()
+        if not filepath:
+            return jsonify({
+                'success': False,
+                'error': 'No APK files found. Please upload an APK first.'
+            }), 404
+        
+        # Calculate checksum
+        with open(filepath, 'rb') as f:
+            apk_content = f.read()
+            digest = hashlib.sha256(apk_content).digest()
+        checksum_b64 = base64.b64encode(digest).decode()
+        checksum_hex = digest.hex()
+        
+        file_size = len(apk_content)
+        
+        return jsonify({
+            'success': True,
+            'filename': filename,
+            'file_size': file_size,
+            'checksum_base64': checksum_b64,
+            'checksum_hex': checksum_hex,
+            'download_url': download_url,
+            'verification_command': f'sha256sum {filename} | awk \'{{print $1}}\' | xxd -r -p | base64'
+        })
+    except Exception as e:
+        logger.error(f"Error verifying checksum: {str(e)}")
         return jsonify({
             'success': False,
             'error': str(e)
