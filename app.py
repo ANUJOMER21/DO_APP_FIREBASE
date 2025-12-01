@@ -373,7 +373,7 @@ def _build_device_owner_payload():
         "android.app.extra.PROVISIONING_DEVICE_ADMIN_PACKAGE_DOWNLOAD_LOCATION": download_url,
         "android.app.extra.PROVISIONING_DEVICE_ADMIN_SIGNATURE_CHECKSUM": checksum_b64,
         "android.app.extra.PROVISIONING_LEAVE_ALL_SYSTEM_APPS_ENABLED": True,
-        "android.app.extra.PROVISIONING_SKIP_ENCRYPTION": false
+        "android.app.extra.PROVISIONING_SKIP_ENCRYPTION": False
     }
 
     return payload, filename, download_url
