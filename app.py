@@ -36,6 +36,7 @@ if os.getenv('FLASK_ENV') == 'production' or os.getenv('ENVIRONMENT') == 'produc
         logger.warning(f"Converted BASE_URL to HTTPS: {base_url}")
 app.config['BASE_URL'] = base_url
 app.config['APK_STORAGE'] = os.getenv('APK_STORAGE_PATH', 'uploads/apk')
+app.config['CHECKSUM_STORAGE'] = os.path.join(app.config['APK_STORAGE'], 'checksums.json')
 
 # Initialize Firebase service
 firebase_service = FirebaseService()
@@ -164,7 +165,13 @@ def send_bulk_command():
 
 @app.route('/api/apk/upload', methods=['POST'])
 def upload_apk():
-    """Upload APK file"""
+    """
+    Upload APK file with optional checksum.
+    
+    Accepts:
+    - 'apk': APK file (required)
+    - 'checksum': SHA-256 checksum in base64url format (optional)
+    """
     try:
         if 'apk' not in request.files:
             return jsonify({
@@ -185,10 +192,20 @@ def upload_apk():
                 'error': 'File must be an APK file'
             }), 400
         
+        # Get optional checksum from form data
+        provided_checksum = request.form.get('checksum', '').strip()
+        
         # Save APK file
         filename = f"aoc_doapp_{datetime.now().strftime('%Y%m%d_%H%M%S')}.apk"
         filepath = os.path.join(app.config['APK_STORAGE'], filename)
         file.save(filepath)
+        
+        # Store checksum if provided
+        if provided_checksum:
+            _set_checksum_for_apk(filename, provided_checksum)
+            logger.info(f"APK uploaded with provided checksum: {filename}")
+        else:
+            logger.info(f"APK uploaded without checksum (will be computed): {filename}")
         
         # Generate download URL - ensure HTTPS in production
         download_url = url_for('download_apk', filename=filename, _external=True)
@@ -202,6 +219,8 @@ def upload_apk():
             'success': True,
             'filename': filename,
             'download_url': download_url,
+            'checksum_provided': bool(provided_checksum),
+            'checksum': provided_checksum if provided_checksum else None,
             'message': 'APK uploaded successfully'
         })
     except Exception as e:
@@ -344,6 +363,44 @@ def _get_latest_apk_info():
         logger.info(f"Converted download URL to HTTPS: {download_url}")
     
     return filepath, latest_apk, download_url
+
+
+def _load_checksums():
+    """Load checksums from storage file"""
+    checksum_file = app.config['CHECKSUM_STORAGE']
+    if os.path.exists(checksum_file):
+        try:
+            with open(checksum_file, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning(f"Error loading checksums: {str(e)}")
+            return {}
+    return {}
+
+
+def _save_checksums(checksums):
+    """Save checksums to storage file"""
+    checksum_file = app.config['CHECKSUM_STORAGE']
+    try:
+        with open(checksum_file, 'w') as f:
+            json.dump(checksums, f, indent=2)
+    except Exception as e:
+        logger.error(f"Error saving checksums: {str(e)}")
+        raise
+
+
+def _get_checksum_for_apk(filename):
+    """Get stored checksum for an APK file"""
+    checksums = _load_checksums()
+    return checksums.get(filename)
+
+
+def _set_checksum_for_apk(filename, checksum):
+    """Store checksum for an APK file"""
+    checksums = _load_checksums()
+    checksums[filename] = checksum
+    _save_checksums(checksums)
+    logger.info(f"Stored checksum for {filename}: {checksum}")
 
 
 def _extract_certificate_using_apksigner(apk_path):
@@ -535,27 +592,36 @@ def _build_device_owner_payload():
     - com.aoc.aoc_doapp/.MyDeviceAdminReceiver as the device admin component
     - Latest uploaded APK as the package download location
     - SHA-256 (base64url) of the APK file as the signature checksum
+    - Uses provided checksum if available, otherwise computes it
     """
     filepath, filename, download_url = _get_latest_apk_info()
     if not filepath:
         raise FileNotFoundError('No APK files found. Please upload an APK first.')
 
-    # Calculate SHA-256 of the APK file itself (like: shasum -a 256 your_app.apk)
-    # Then convert to base64url format (required by Android Device Owner provisioning)
-    with open(filepath, 'rb') as f:
-        apk_content = f.read()
-        digest = hashlib.sha256(apk_content).digest()
+    # Check if checksum was provided during upload
+    stored_checksum = _get_checksum_for_apk(filename)
     
-    # Encode as base64, then convert to base64url
-    checksum_b64 = base64.b64encode(digest).decode()
-    checksum_b64url = _base64_to_base64url(checksum_b64)
-    checksum_hex = digest.hex()
-    
-    # Log checksum for debugging
-    logger.info(f"APK file checksum (hex) for {filename}: {checksum_hex}")
-    logger.info(f"APK file checksum (base64) for {filename}: {checksum_b64}")
-    logger.info(f"APK file checksum (base64url) for {filename}: {checksum_b64url}")
-    logger.info(f"APK file size: {len(apk_content)} bytes")
+    if stored_checksum:
+        # Use provided checksum (assume it's already in base64url format)
+        checksum_b64url = stored_checksum
+        logger.info(f"Using provided checksum for {filename}: {checksum_b64url}")
+    else:
+        # Calculate SHA-256 of the APK file itself (like: shasum -a 256 your_app.apk)
+        # Then convert to base64url format (required by Android Device Owner provisioning)
+        with open(filepath, 'rb') as f:
+            apk_content = f.read()
+            digest = hashlib.sha256(apk_content).digest()
+        
+        # Encode as base64, then convert to base64url
+        checksum_b64 = base64.b64encode(digest).decode()
+        checksum_b64url = _base64_to_base64url(checksum_b64)
+        checksum_hex = digest.hex()
+        
+        # Log checksum for debugging
+        logger.info(f"Computed APK file checksum (hex) for {filename}: {checksum_hex}")
+        logger.info(f"Computed APK file checksum (base64) for {filename}: {checksum_b64}")
+        logger.info(f"Computed APK file checksum (base64url) for {filename}: {checksum_b64url}")
+        logger.info(f"APK file size: {len(apk_content)} bytes")
 
     payload = {
         "android.app.extra.PROVISIONING_DEVICE_ADMIN_COMPONENT_NAME": "com.aoc.aoc_doapp/com.aoc.aoc_doapp.MyDeviceAdminReceiver",
@@ -695,10 +761,78 @@ def verify_checksum():
             'checksum_hex': checksum_hex,
             'download_url': download_url,
             'verification_command': f'shasum -a 256 {filename}',
-            'note': 'This is the SHA-256 of the APK file itself, converted to base64url format for Device Owner provisioning'
+            'note': 'This is the SHA-256 of the APK file itself, converted to base64url format for Device Owner provisioning',
+            'stored_checksum': _get_checksum_for_apk(filename)
         })
     except Exception as e:
         logger.error(f"Error verifying checksum: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/api/apk/set-checksum', methods=['POST'])
+def set_checksum():
+    """
+    Set or update the checksum for an APK file.
+    
+    Accepts JSON:
+    {
+        "filename": "aoc_doapp_20251201_174056.apk",
+        "checksum": "base64url_checksum_here"
+    }
+    
+    Or for latest APK:
+    {
+        "checksum": "base64url_checksum_here"
+    }
+    """
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({
+                'success': False,
+                'error': 'No JSON data provided'
+            }), 400
+        
+        checksum = data.get('checksum', '').strip()
+        if not checksum:
+            return jsonify({
+                'success': False,
+                'error': 'Checksum is required'
+            }), 400
+        
+        filename = data.get('filename')
+        
+        # If filename not provided, use latest APK
+        if not filename:
+            _, latest_filename, _ = _get_latest_apk_info()
+            if not latest_filename:
+                return jsonify({
+                    'success': False,
+                    'error': 'No APK files found and no filename provided'
+                }), 404
+            filename = latest_filename
+        
+        # Validate that the APK file exists
+        filepath = os.path.join(app.config['APK_STORAGE'], filename)
+        if not os.path.exists(filepath):
+            return jsonify({
+                'success': False,
+                'error': f'APK file not found: {filename}'
+            }), 404
+        
+        # Store the checksum
+        _set_checksum_for_apk(filename, checksum)
+        
+        return jsonify({
+            'success': True,
+            'filename': filename,
+            'checksum': checksum,
+            'message': f'Checksum stored for {filename}'
+        })
+    except Exception as e:
+        logger.error(f"Error setting checksum: {str(e)}")
         return jsonify({
             'success': False,
             'error': str(e)
