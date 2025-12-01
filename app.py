@@ -200,10 +200,20 @@ def upload_apk():
         filepath = os.path.join(app.config['APK_STORAGE'], filename)
         file.save(filepath)
         
-        # Store checksum if provided
+        # Store checksum if provided (normalize to base64url format)
         if provided_checksum:
-            _set_checksum_for_apk(filename, provided_checksum)
-            logger.info(f"APK uploaded with provided checksum: {filename}")
+            try:
+                normalized_checksum = _normalize_checksum_to_base64url(provided_checksum)
+                _set_checksum_for_apk(filename, normalized_checksum)
+                logger.info(f"APK uploaded with provided checksum (normalized): {filename}")
+                logger.info(f"Original checksum: {provided_checksum}")
+                logger.info(f"Normalized checksum (base64url): {normalized_checksum}")
+            except ValueError as e:
+                logger.error(f"Invalid checksum format: {str(e)}")
+                return jsonify({
+                    'success': False,
+                    'error': f'Invalid checksum format: {str(e)}. Please provide checksum in base64url, base64, or hex format.'
+                }), 400
         else:
             logger.info(f"APK uploaded without checksum (will be computed): {filename}")
         
@@ -584,6 +594,77 @@ def _base64_to_base64url(b64_string):
     return b64url
 
 
+def _normalize_checksum_to_base64url(checksum_input):
+    """
+    Normalize checksum input to base64url format.
+    Accepts:
+    - Base64url format (already correct)
+    - Standard base64 format (with +, /, =)
+    - Hex format (64 character hex string)
+    
+    Returns base64url formatted checksum (no +, /, =, or other invalid chars).
+    """
+    import urllib.parse
+    
+    checksum = checksum_input.strip()
+    
+    if not checksum:
+        raise ValueError("Checksum cannot be empty")
+    
+    # Remove any URL encoding artifacts (like %3D for =, etc.)
+    # First try to decode if it looks URL encoded
+    if '%' in checksum:
+        try:
+            checksum = urllib.parse.unquote(checksum)
+        except Exception:
+            pass  # If decoding fails, continue with original
+    
+    # Remove any whitespace or invalid characters
+    checksum = checksum.strip().rstrip('=%')  # Remove trailing = or % that might be artifacts
+    
+    if not checksum:
+        raise ValueError("Checksum is empty after cleaning")
+    
+    # Check if it's hex format (64 character hex string)
+    if len(checksum) == 64 and all(c in '0123456789abcdefABCDEF' for c in checksum):
+        # It's hex format - convert to base64url
+        try:
+            digest = bytes.fromhex(checksum)
+            checksum_b64 = base64.b64encode(digest).decode()
+            return _base64_to_base64url(checksum_b64)
+        except ValueError:
+            raise ValueError(f"Invalid hex checksum format: {checksum}")
+    
+    # Check if it's standard base64 (has +, /, or =)
+    if '+' in checksum or '/' in checksum or '=' in checksum:
+        # Convert from standard base64 to base64url
+        # First validate it's valid base64
+        try:
+            # Try to decode to validate
+            base64.b64decode(checksum + '==')  # Add padding for validation
+        except Exception:
+            raise ValueError(f"Invalid base64 format: {checksum}")
+        return _base64_to_base64url(checksum)
+    
+    # Check if it looks like base64url (43-44 chars, alphanumeric + - and _)
+    if len(checksum) >= 40 and len(checksum) <= 44:
+        # Validate it only contains base64url characters
+        valid_chars = set('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_')
+        if all(c in valid_chars for c in checksum):
+            # Remove any trailing padding characters
+            return checksum.rstrip('=')
+    
+    # If we get here, try to validate and convert
+    # Remove any invalid trailing characters
+    checksum = checksum.rstrip('=%')
+    
+    # Final validation - should be 43 characters for SHA-256 in base64url
+    if len(checksum) == 43:
+        return checksum
+    
+    raise ValueError(f"Invalid checksum format or length: {checksum} (length: {len(checksum)})")
+
+
 def _build_device_owner_payload():
     """
     Build Android Device Owner provisioning payload based on the latest APK.
@@ -601,11 +682,33 @@ def _build_device_owner_payload():
     # Check if checksum was provided during upload
     stored_checksum = _get_checksum_for_apk(filename)
     
+    checksum_b64url = None
+    
     if stored_checksum:
-        # Use provided checksum (assume it's already in base64url format)
-        checksum_b64url = stored_checksum
-        logger.info(f"Using provided checksum for {filename}: {checksum_b64url}")
-    else:
+        # Use provided checksum (should already be normalized to base64url format)
+        # But normalize again just in case to handle any edge cases
+        try:
+            logger.info(f"Raw stored checksum for {filename}: {repr(stored_checksum)}")
+            checksum_b64url = _normalize_checksum_to_base64url(stored_checksum)
+            logger.info(f"Normalized checksum (base64url) for {filename}: {checksum_b64url}")
+            logger.info(f"Checksum length: {len(checksum_b64url)} (should be 43 for SHA-256)")
+            
+            # Final validation - ensure it's exactly 43 characters and valid base64url
+            if len(checksum_b64url) != 43:
+                raise ValueError(f"Checksum length is {len(checksum_b64url)}, expected 43 for SHA-256 base64url")
+            
+            # Check for invalid characters
+            invalid_chars = set(checksum_b64url) - set('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_')
+            if invalid_chars:
+                raise ValueError(f"Checksum contains invalid characters: {invalid_chars}")
+                
+        except ValueError as e:
+            logger.error(f"Stored checksum validation failed for {filename}: {str(e)}")
+            logger.warning(f"Falling back to computing checksum from APK file")
+            stored_checksum = None
+            checksum_b64url = None
+    
+    if not checksum_b64url:
         # Calculate SHA-256 of the APK file itself (like: shasum -a 256 your_app.apk)
         # Then convert to base64url format (required by Android Device Owner provisioning)
         with open(filepath, 'rb') as f:
@@ -621,7 +724,23 @@ def _build_device_owner_payload():
         logger.info(f"Computed APK file checksum (hex) for {filename}: {checksum_hex}")
         logger.info(f"Computed APK file checksum (base64) for {filename}: {checksum_b64}")
         logger.info(f"Computed APK file checksum (base64url) for {filename}: {checksum_b64url}")
+        logger.info(f"Checksum length: {len(checksum_b64url)} (should be 43 for SHA-256)")
         logger.info(f"APK file size: {len(apk_content)} bytes")
+        
+        # Final validation
+        if len(checksum_b64url) != 43:
+            logger.error(f"WARNING: Computed checksum length is {len(checksum_b64url)}, expected 43!")
+
+    # Final validation before using checksum in payload
+    if len(checksum_b64url) != 43:
+        raise ValueError(f"Invalid checksum length: {len(checksum_b64url)}, expected 43 for SHA-256 base64url")
+    
+    # Ensure no invalid characters
+    invalid_chars = set(checksum_b64url) - set('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_')
+    if invalid_chars:
+        raise ValueError(f"Checksum contains invalid characters: {invalid_chars}")
+    
+    logger.info(f"Final checksum to use in payload: {checksum_b64url}")
 
     payload = {
         "android.app.extra.PROVISIONING_DEVICE_ADMIN_COMPONENT_NAME": "com.aoc.aoc_doapp/com.aoc.aoc_doapp.MyDeviceAdminReceiver",
@@ -822,15 +941,23 @@ def set_checksum():
                 'error': f'APK file not found: {filename}'
             }), 404
         
-        # Store the checksum
-        _set_checksum_for_apk(filename, checksum)
-        
-        return jsonify({
-            'success': True,
-            'filename': filename,
-            'checksum': checksum,
-            'message': f'Checksum stored for {filename}'
-        })
+        # Normalize checksum to base64url format
+        try:
+            normalized_checksum = _normalize_checksum_to_base64url(checksum)
+            _set_checksum_for_apk(filename, normalized_checksum)
+            
+            return jsonify({
+                'success': True,
+                'filename': filename,
+                'checksum_original': checksum,
+                'checksum_normalized': normalized_checksum,
+                'message': f'Checksum stored for {filename}'
+            })
+        except ValueError as e:
+            return jsonify({
+                'success': False,
+                'error': f'Invalid checksum format: {str(e)}. Please provide checksum in base64url, base64, or hex format.'
+            }), 400
     except Exception as e:
         logger.error(f"Error setting checksum: {str(e)}")
         return jsonify({

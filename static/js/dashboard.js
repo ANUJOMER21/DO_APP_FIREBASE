@@ -318,7 +318,10 @@ async function updateChecksum() {
         const data = await response.json();
         
         if (data.success) {
-            showToast(`Checksum updated for ${data.filename}`, 'success');
+            const message = data.checksum_normalized 
+                ? `Checksum updated for ${data.filename}\nOriginal: ${data.checksum_original}\nNormalized: ${data.checksum_normalized}`
+                : `Checksum updated for ${data.filename}`;
+            showToast(message, 'success');
             checksumInput.value = '';
         } else {
             showToast('Error: ' + data.error, 'error');
@@ -326,6 +329,32 @@ async function updateChecksum() {
     } catch (error) {
         console.error('Error updating checksum:', error);
         showToast('Failed to update checksum', 'error');
+    }
+}
+
+// View current checksum information
+async function viewChecksum() {
+    try {
+        const response = await fetch('/api/apk/verify-checksum');
+        const data = await response.json();
+        
+        if (data.success) {
+            let message = `Checksum for: ${data.filename}\n\n`;
+            message += `Computed (Base64URL): ${data.checksum_base64url}\n`;
+            message += `Computed (Base64): ${data.checksum_base64}\n`;
+            message += `Computed (Hex): ${data.checksum_hex}\n`;
+            if (data.stored_checksum) {
+                message += `\nStored Checksum: ${data.stored_checksum}`;
+            } else {
+                message += `\nNo stored checksum (using computed)`;
+            }
+            alert(message);
+        } else {
+            showToast('Error: ' + data.error, 'error');
+        }
+    } catch (error) {
+        console.error('Error viewing checksum:', error);
+        showToast('Failed to view checksum', 'error');
     }
 }
 
