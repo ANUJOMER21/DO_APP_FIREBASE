@@ -3,7 +3,8 @@ AOC Device Control Dashboard
 Python Flask backend for managing Android devices via Firebase
 """
 import os
-from flask import Flask, render_template, jsonify, request, send_file, url_for
+import posixpath
+from flask import Flask, render_template, jsonify, request, send_file, url_for, Response
 from flask_cors import CORS
 import qrcode
 from io import BytesIO
@@ -211,55 +212,58 @@ def download_apk(filename):
     """
     Download APK file with correct MIME type and headers for Android Device Owner provisioning.
     
-    Requirements:
+    Returns raw APK file bytes with NO redirect, NO JSON, NO HTML.
+    Required headers:
     - Content-Type: application/vnd.android.package-archive
-    - Content-Length: file size
-    - No redirects (direct file serving)
-    - HTTPS URL (enforced in production)
+    - Content-Disposition: attachment; filename="<real_name>.apk"
     """
+    # Security: Validate filename to prevent directory traversal
+    filename = posixpath.basename(filename)
+    if not filename or not filename.endswith('.apk'):
+        return Response('Invalid filename', status=400, mimetype='text/plain')
+    
+    filepath = os.path.join(app.config['APK_STORAGE'], filename)
+    
+    # Validate file exists and is within allowed directory
+    if not os.path.exists(filepath):
+        return Response('APK file not found', status=404, mimetype='text/plain')
+    
+    # Ensure filepath is within APK_STORAGE (prevent directory traversal)
+    real_storage = os.path.realpath(app.config['APK_STORAGE'])
+    real_filepath = os.path.realpath(filepath)
+    if not real_filepath.startswith(real_storage):
+        return Response('Invalid file path', status=403, mimetype='text/plain')
+    
     try:
-        filepath = os.path.join(app.config['APK_STORAGE'], filename)
-        if not os.path.exists(filepath):
-            return jsonify({
-                'success': False,
-                'error': 'APK file not found'
-            }), 404
+        # Stream file in binary mode
+        def generate():
+            with open(filepath, 'rb') as f:
+                while True:
+                    chunk = f.read(8192)  # 8KB chunks
+                    if not chunk:
+                        break
+                    yield chunk
         
-        # Get file size for Content-Length header
         file_size = os.path.getsize(filepath)
         
-        # Send file with correct MIME type for Android APK
-        # as_attachment=False to serve directly (not as download)
-        # This is required for Device Owner provisioning
-        # conditional=True enables range requests for better streaming of large files
-        response = send_file(
-            filepath,
+        # Create response with binary streaming
+        response = Response(
+            generate(),
             mimetype='application/vnd.android.package-archive',
-            as_attachment=False,
-            download_name=filename,
-            conditional=True  # Enables HTTP 206 Partial Content for better streaming
+            headers={
+                'Content-Type': 'application/vnd.android.package-archive',
+                'Content-Disposition': f'attachment; filename="{filename}"',
+                'Content-Length': str(file_size),
+                'Cache-Control': 'no-cache, no-store, must-revalidate',
+                'Pragma': 'no-cache',
+                'Expires': '0'
+            }
         )
-        
-        # Set Content-Length header explicitly (send_file should set this, but ensure it's correct)
-        response.headers['Content-Length'] = str(file_size)
-        
-        # Disable caching to ensure fresh downloads
-        response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
-        response.headers['Pragma'] = 'no-cache'
-        response.headers['Expires'] = '0'
-        
-        # Ensure no redirects - direct file serving
-        # Remove any Location header that might cause redirects
-        if 'Location' in response.headers:
-            del response.headers['Location']
         
         return response
     except Exception as e:
         logger.error(f"Error downloading APK: {str(e)}")
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
+        return Response(f'Server error: {str(e)}', status=500, mimetype='text/plain')
 
 @app.route('/api/apk/qrcode', methods=['GET'])
 def generate_qr_code():
