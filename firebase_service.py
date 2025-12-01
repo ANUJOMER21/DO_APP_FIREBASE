@@ -3,6 +3,7 @@ Firebase Service for AOC Device Control
 Handles all Firebase Realtime Database operations
 """
 import os
+import json
 import firebase_admin
 from firebase_admin import credentials, db
 import logging
@@ -10,28 +11,56 @@ from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
+
 class FirebaseService:
     """Service for interacting with Firebase Realtime Database"""
-    
+
     def __init__(self):
-        """Initialize Firebase Admin SDK"""
-        self.database_url = os.getenv('FIREBASE_DATABASE_URL', 
-                                     'https://aoc-device-control-default-rtdb.firebaseio.com/')
-        self.credentials_path = os.getenv('FIREBASE_CREDENTIALS_PATH', 
-                                         'firebase-service-account.json')
-        
+        """Initialize Firebase Admin SDK
+
+        Render / cloud-friendly initialization:
+        - Prefer credentials passed via FIREBASE_CREDENTIALS_JSON (env var)
+        - Fallback to FIREBASE_CREDENTIALS_PATH pointing to a JSON file
+        """
+        self.database_url = os.getenv(
+            'FIREBASE_DATABASE_URL',
+            'https://aoc-device-control-default-rtdb.firebaseio.com/'
+        )
+        self.credentials_path = os.getenv(
+            'FIREBASE_CREDENTIALS_PATH',
+            'firebase-service-account.json'
+        )
+        self.credentials_json = os.getenv('FIREBASE_CREDENTIALS_JSON')
+
         # Initialize Firebase if not already initialized
         if not firebase_admin._apps:
             try:
-                if os.path.exists(self.credentials_path):
+                cred = None
+
+                # 1. Prefer JSON from environment (best for platforms like Render)
+                if self.credentials_json:
+                    try:
+                        cred_info = json.loads(self.credentials_json)
+                        cred = credentials.Certificate(cred_info)
+                        logger.info("Initializing Firebase from FIREBASE_CREDENTIALS_JSON")
+                    except Exception as e:
+                        logger.error(f"Failed to parse FIREBASE_CREDENTIALS_JSON: {e}")
+
+                # 2. Fallback to credentials file path
+                if cred is None and os.path.exists(self.credentials_path):
                     cred = credentials.Certificate(self.credentials_path)
+                    logger.info(f"Initializing Firebase from credentials file at {self.credentials_path}")
+
+                if cred is not None:
                     firebase_admin.initialize_app(cred, {
                         'databaseURL': self.database_url
                     })
                     logger.info("Firebase Admin SDK initialized successfully")
                 else:
-                    logger.warning(f"Firebase credentials file not found at {self.credentials_path}")
-                    logger.warning("Firebase operations will not work. Please set FIREBASE_CREDENTIALS_PATH")
+                    logger.warning(
+                        "Firebase credentials not provided. "
+                        "Set FIREBASE_CREDENTIALS_JSON or FIREBASE_CREDENTIALS_PATH."
+                    )
             except Exception as e:
                 logger.error(f"Failed to initialize Firebase: {str(e)}")
     
