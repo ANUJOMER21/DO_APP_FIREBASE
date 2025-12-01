@@ -369,10 +369,11 @@ def _build_device_owner_payload():
     logger.info(f"APK file size: {len(apk_content)} bytes")
 
     payload = {
-        "android.app.extra.PROVISIONING_DEVICE_ADMIN_COMPONENT_NAME": "com.aoc.aoc_doapp/.MyDeviceAdminReceiver",
+        "android.app.extra.PROVISIONING_DEVICE_ADMIN_COMPONENT_NAME": "com.aoc.aoc_doapp/com.aoc.aoc_doapp.MyDeviceAdminReceiver",
         "android.app.extra.PROVISIONING_DEVICE_ADMIN_PACKAGE_DOWNLOAD_LOCATION": download_url,
         "android.app.extra.PROVISIONING_DEVICE_ADMIN_SIGNATURE_CHECKSUM": checksum_b64,
-        "android.app.extra.PROVISIONING_LEAVE_ALL_SYSTEM_APPS_ENABLED": True
+        "android.app.extra.PROVISIONING_LEAVE_ALL_SYSTEM_APPS_ENABLED": True,
+        "android.app.extra.PROVISIONING_SKIP_ENCRYPTION": false
     }
 
     return payload, filename, download_url
