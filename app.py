@@ -342,6 +342,19 @@ def _get_latest_apk_info():
     return filepath, latest_apk, download_url
 
 
+def _base64_to_base64url(b64_string):
+    """
+    Convert standard base64 encoding to base64url encoding.
+    Base64url uses '-' instead of '+', '_' instead of '/', and removes padding '='.
+    This is required by Android Device Owner provisioning.
+    """
+    # Replace characters
+    b64url = b64_string.replace('+', '-').replace('/', '_')
+    # Remove padding
+    b64url = b64url.rstrip('=')
+    return b64url
+
+
 def _build_device_owner_payload():
     """
     Build Android Device Owner provisioning payload based on the latest APK.
@@ -349,13 +362,13 @@ def _build_device_owner_payload():
     Uses:
     - com.aoc.aoc_doapp/.MyDeviceAdminReceiver as the device admin component
     - Latest uploaded APK as the package download location
-    - SHA-256 (base64) of the APK as the signature checksum
+    - SHA-256 (base64url) of the APK as the signature checksum
     """
     filepath, filename, download_url = _get_latest_apk_info()
     if not filepath:
         raise FileNotFoundError('No APK files found. Please upload an APK first.')
 
-    # Calculate SHA-256 and encode as base64 (required by Android for checksum)
+    # Calculate SHA-256 and encode as base64url (required by Android for checksum)
     # Note: This calculates SHA-256 of the entire APK file.
     # For Device Owner provisioning, Android typically requires the certificate's SHA-256,
     # but some setups use the file's SHA-256. This matches: sha256sum <apk> | awk '{print $1}' | xxd -r -p | base64
@@ -363,15 +376,18 @@ def _build_device_owner_payload():
         apk_content = f.read()
         digest = hashlib.sha256(apk_content).digest()
     checksum_b64 = base64.b64encode(digest).decode()
+    # Convert to base64url format (required by Android Device Owner provisioning)
+    checksum_b64url = _base64_to_base64url(checksum_b64)
     
     # Log checksum for debugging
-    logger.info(f"Generated checksum for {filename}: {checksum_b64}")
+    logger.info(f"Generated checksum (base64) for {filename}: {checksum_b64}")
+    logger.info(f"Generated checksum (base64url) for {filename}: {checksum_b64url}")
     logger.info(f"APK file size: {len(apk_content)} bytes")
 
     payload = {
         "android.app.extra.PROVISIONING_DEVICE_ADMIN_COMPONENT_NAME": "com.aoc.aoc_doapp/com.aoc.aoc_doapp.MyDeviceAdminReceiver",
         "android.app.extra.PROVISIONING_DEVICE_ADMIN_PACKAGE_DOWNLOAD_LOCATION": download_url,
-        "android.app.extra.PROVISIONING_DEVICE_ADMIN_SIGNATURE_CHECKSUM": checksum_b64,
+        "android.app.extra.PROVISIONING_DEVICE_ADMIN_SIGNATURE_CHECKSUM": checksum_b64url,
         "android.app.extra.PROVISIONING_LEAVE_ALL_SYSTEM_APPS_ENABLED": True,
         "android.app.extra.PROVISIONING_SKIP_ENCRYPTION": False
     }
@@ -489,6 +505,7 @@ def verify_checksum():
             apk_content = f.read()
             digest = hashlib.sha256(apk_content).digest()
         checksum_b64 = base64.b64encode(digest).decode()
+        checksum_b64url = _base64_to_base64url(checksum_b64)
         checksum_hex = digest.hex()
         
         file_size = len(apk_content)
@@ -498,6 +515,7 @@ def verify_checksum():
             'filename': filename,
             'file_size': file_size,
             'checksum_base64': checksum_b64,
+            'checksum_base64url': checksum_b64url,
             'checksum_hex': checksum_hex,
             'download_url': download_url,
             'verification_command': f'sha256sum {filename} | awk \'{{print $1}}\' | xxd -r -p | base64'
