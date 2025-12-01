@@ -223,6 +223,7 @@ async function uploadAPK(e) {
     e.preventDefault();
     
     const fileInput = document.getElementById('apkFile');
+    const checksumInput = document.getElementById('apkChecksum');
     const file = fileInput.files[0];
     
     if (!file) {
@@ -232,6 +233,12 @@ async function uploadAPK(e) {
     
     const formData = new FormData();
     formData.append('apk', file);
+    
+    // Add checksum if provided
+    const checksum = checksumInput.value.trim();
+    if (checksum) {
+        formData.append('checksum', checksum);
+    }
     
     try {
         showToast('Uploading APK...', 'info');
@@ -244,8 +251,12 @@ async function uploadAPK(e) {
         const data = await response.json();
         
         if (data.success) {
-            showToast('APK uploaded successfully!', 'success');
+            const message = data.checksum_provided 
+                ? 'APK uploaded successfully with checksum!'
+                : 'APK uploaded successfully!';
+            showToast(message, 'success');
             fileInput.value = '';
+            checksumInput.value = '';
         } else {
             showToast('Error: ' + data.error, 'error');
         }
@@ -282,6 +293,39 @@ async function showQRCode() {
         console.error('Error generating QR code:', error);
         container.innerHTML = '<div class="alert alert-danger">Failed to generate QR code</div>';
         downloadLink.style.display = 'none';
+    }
+}
+
+// Update checksum for latest APK
+async function updateChecksum() {
+    const checksumInput = document.getElementById('updateChecksum');
+    const checksum = checksumInput.value.trim();
+    
+    if (!checksum) {
+        showToast('Please enter a checksum', 'warning');
+        return;
+    }
+    
+    try {
+        const response = await fetch('/api/apk/set-checksum', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ checksum: checksum })
+        });
+        
+        const data = await response.json();
+        
+        if (data.success) {
+            showToast(`Checksum updated for ${data.filename}`, 'success');
+            checksumInput.value = '';
+        } else {
+            showToast('Error: ' + data.error, 'error');
+        }
+    } catch (error) {
+        console.error('Error updating checksum:', error);
+        showToast('Failed to update checksum', 'error');
     }
 }
 
